@@ -5,6 +5,11 @@ edition = "2021"
 authors = ["Danny Dulai <danny@roonlabs.com>"]
 description = "Implementation of the MOO protocol, an HTTP-like bidirectional message protocol"
 license = "MIT"
+repository = "https://github.com/dannydulai/moo-transport"
+homepage = "https://github.com/dannydulai/moo-transport"
+readme = "README.md"
+keywords = ["moo", "protocol", "transport", "rpc", "async"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
