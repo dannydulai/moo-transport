@@ -79,21 +79,13 @@ pub(crate) fn split_tcp(stream: TcpStream) -> (TcpTransportSend, TcpTransportRec
 /// WebSocket send half.
 #[cfg(feature = "websocket")]
 pub(crate) struct WebSocketTransportSend {
-    ws: std::sync::Arc<tokio::sync::Mutex<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    >>,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 
 #[cfg(feature = "websocket")]
 impl WebSocketTransportSend {
-    pub fn new(
-        ws: std::sync::Arc<
-            tokio::sync::Mutex<
-                tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-            >,
-        >,
-    ) -> Self {
-        Self { ws }
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self { tx }
     }
 }
 
@@ -101,12 +93,9 @@ impl WebSocketTransportSend {
 #[async_trait]
 impl TransportSend for WebSocketTransportSend {
     async fn send(&mut self, data: &[u8]) -> Result<()> {
-        use futures::SinkExt;
-        use tokio_tungstenite::tungstenite::Message;
-
-        let msg = Message::Binary(data.to_vec());
-        let mut ws = self.ws.lock().await;
-        ws.send(msg).await?;
+        self.tx
+            .send(data.to_vec())
+            .map_err(|_| crate::error::MooError::ConnectionClosed)?;
         Ok(())
     }
 }
@@ -114,21 +103,13 @@ impl TransportSend for WebSocketTransportSend {
 /// WebSocket receive half.
 #[cfg(feature = "websocket")]
 pub(crate) struct WebSocketTransportRecv {
-    ws: std::sync::Arc<tokio::sync::Mutex<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    >>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 #[cfg(feature = "websocket")]
 impl WebSocketTransportRecv {
-    pub fn new(
-        ws: std::sync::Arc<
-            tokio::sync::Mutex<
-                tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-            >,
-        >,
-    ) -> Self {
-        Self { ws }
+    pub fn new(rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self { rx }
     }
 }
 
@@ -136,19 +117,8 @@ impl WebSocketTransportRecv {
 #[async_trait]
 impl TransportRecv for WebSocketTransportRecv {
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        use futures::StreamExt;
-        use tokio_tungstenite::tungstenite::Message;
-
-        let mut ws = self.ws.lock().await;
-        match ws.next().await {
-            Some(Ok(Message::Binary(data))) => Ok(Some(data)),
-            Some(Ok(Message::Close(_))) => Ok(None),
-            Some(Ok(_)) => {
-                // Ignore non-binary messages (text, ping, pong, etc.)
-                drop(ws);
-                self.recv().await
-            }
-            Some(Err(e)) => Err(e.into()),
+        match self.rx.recv().await {
+            Some(data) => Ok(Some(data)),
             None => Ok(None),
         }
     }
@@ -159,10 +129,50 @@ impl TransportRecv for WebSocketTransportRecv {
 pub(crate) async fn connect_websocket(
     url: impl AsRef<str>,
 ) -> Result<(WebSocketTransportSend, WebSocketTransportRecv)> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
     let (ws, _) = tokio_tungstenite::connect_async(url.as_ref()).await?;
-    let ws = std::sync::Arc::new(tokio::sync::Mutex::new(ws));
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // Create channels for send and receive
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (recv_tx, recv_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Spawn task to forward outgoing messages to WebSocket
+    tokio::spawn(async move {
+        while let Some(data) = send_rx.recv().await {
+            let msg = Message::Binary(data);
+            if let Err(e) = ws_sink.send(msg).await {
+                tracing::error!("WebSocket send error: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Spawn task to forward incoming messages from WebSocket
+    tokio::spawn(async move {
+        while let Some(msg_result) = ws_stream.next().await {
+            match msg_result {
+                Ok(Message::Binary(data)) => {
+                    if recv_tx.send(data).is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {
+                    // Ignore other message types (text, ping, pong, etc.)
+                }
+                Err(e) => {
+                    tracing::error!("WebSocket receive error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
     Ok((
-        WebSocketTransportSend::new(ws.clone()),
-        WebSocketTransportRecv::new(ws),
+        WebSocketTransportSend::new(send_tx),
+        WebSocketTransportRecv::new(recv_rx),
     ))
 }
